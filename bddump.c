@@ -112,6 +112,14 @@ exit:
 int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     int ret;
 
+    /* Count titles and validate num titles. */
+    uint32_t num_titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
+    if (title_index >= num_titles) {
+        fprintf(stderr, "Disc has only %" PRIu32 " titles, but index %" PRIu32 " was specified\n", num_titles, title_index);
+        ret = 1;
+        goto exit;
+    }
+
     /* Select title. */
     if (bd_select_title(bd, title_index) != 1) {
         fprintf(stderr, "bd_select_title failed\n");
@@ -179,7 +187,7 @@ int main(int argc, char **argv) {
     }
 
     /* Open BD disc. */
-    BLURAY *bd = bd_open(options.input_device_path, NULL);
+    BLURAY *bd = bd_open(options.input_device_path, "/home/nngai/.config/aacs/KEYDB.cfg");
     if (!bd) {
         fprintf(stderr, "bd_open failed\n");
         ret = EXIT_FAILURE;
@@ -192,6 +200,28 @@ int main(int argc, char **argv) {
             ret = EXIT_FAILURE;
             goto exit_close_bd;
         }
+        break;
+
+    case BDDUMP_OP_DUMP:
+        /* Validate inputs. */
+        if (options.title_index == UINT32_MAX) {
+            fprintf(stderr, "Error: No title index specified\n\n");
+            usage(argv);
+            ret = EXIT_FAILURE;
+            goto exit_close_bd;
+        }
+        if (!options.out_path) {
+            fprintf(stderr, "Error: No output file specified\n\n");
+            usage(argv);
+            ret = EXIT_FAILURE;
+            goto exit_close_bd;
+        }
+
+        if (dump_bluray(bd, options.title_index, options.out_path)) {
+            ret = EXIT_FAILURE;
+            goto exit_close_bd;
+        }
+
         break;
 
     default:
