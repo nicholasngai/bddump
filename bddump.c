@@ -1,11 +1,14 @@
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <libbluray/bluray.h>
+
+#define DEFAULT_AACS_KEYDB_PATH_HOME_SUFFIX "/.config/aacs/KEYDB.cfg"
 
 enum bddump_operation {
     BDDUMP_OP_LIST_TITLES = 1,
@@ -15,6 +18,8 @@ enum bddump_operation {
 struct bddump_options {
     enum bddump_operation op;
     const char *input_device_path;
+    char *aacs_keydb_path;
+    bool aacs_keydb_path_is_alloced;
     uint32_t title_index;
     const char *out_path;
 };
@@ -22,13 +27,15 @@ struct bddump_options {
 static void usage(char **argv) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "%s -d <device> -l\n", argv[0]);
-    fprintf(stderr, "%s -d <device> -t <title> -o <out file>\n", argv[0]);
-    fprintf(stderr, "%s -d <device> -t <title> -o -\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -l\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> -o <out file>\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> -o -\n", argv[0]);
 }
 
 /* Parses arguments from the command line. */
-static void parse_options(int argc, char **argv, struct bddump_options *options) {
+static int parse_options(int argc, char **argv, struct bddump_options *options) {
+    int ret;
+
     /* Clear options and assign defaults. */
     *options = (struct bddump_options) {
         .op = BDDUMP_OP_DUMP,
@@ -36,7 +43,7 @@ static void parse_options(int argc, char **argv, struct bddump_options *options)
     };
 
     for (;;) {
-        int opt = getopt(argc, argv, "d:lt:o:h");
+        int opt = getopt(argc, argv, "d:a:lt:o:h");
         if (opt == -1) {
             break;
         }
@@ -53,11 +60,13 @@ static void parse_options(int argc, char **argv, struct bddump_options *options)
             unsigned long title_index = strtoul(optarg, &endptr, 10);
             if (*endptr) {
                 fprintf(stderr, "Invalid title index: %s\n", optarg);
-                exit(EXIT_FAILURE);
+                ret = -1;
+                goto exit;
             }
             if (title_index == ULONG_MAX) {
                 perror("strtoul");
-                exit(EXIT_FAILURE);
+                ret = -1;
+                goto exit;
             }
             options->title_index = title_index;
             break;
@@ -65,11 +74,49 @@ static void parse_options(int argc, char **argv, struct bddump_options *options)
         case 'o':
             options->out_path = optarg;
             break;
+        case 'a':
+            options->aacs_keydb_path = optarg;
+            break;
         case 'h':
         default:
             usage(argv);
             exit(EXIT_FAILURE);
         }
+    }
+
+    /* If no aacs_keydb_path specified, allocate a buffer for
+     * $HOME/.config/aacs/KEYDB.cfg. */
+    if (!options->aacs_keydb_path) {
+        /* Get HOME env variable. */
+        const char *home = getenv("HOME");
+        if (!home) {
+            fprintf(stderr, "HOME variable is unset; cannot infer default AACS KEYDB.cfg path!\n");
+            ret = -1;
+            goto exit;
+        }
+
+        /* Alloc buffer for $HOME/.config/aacs/KEYDB.cfg. */
+        char *home_keydb = (char *) malloc(strlen(home) + strlen(DEFAULT_AACS_KEYDB_PATH_HOME_SUFFIX) + 1);
+        if (!home_keydb) {
+            perror("malloc home_keydb");
+            ret = -1;
+            goto exit;
+        }
+        sprintf(home_keydb, "%s" DEFAULT_AACS_KEYDB_PATH_HOME_SUFFIX, home);
+
+        options->aacs_keydb_path = home_keydb;
+        options->aacs_keydb_path_is_alloced = true;
+    }
+
+    ret = 0;
+
+exit:
+    return ret;
+}
+
+static void free_options(struct bddump_options *options) {
+    if (options->aacs_keydb_path_is_alloced) {
+        free(options->aacs_keydb_path);
     }
 }
 
@@ -180,20 +227,23 @@ int main(int argc, char **argv) {
 
     /* Parse args. */
     struct bddump_options options;
-    parse_options(argc, argv, &options);
+    if (parse_options(argc, argv, &options)) {
+        ret = EXIT_FAILURE;
+        goto exit;
+    }
     if (!options.input_device_path) {
         fprintf(stderr, "Error: input device is required\n\n");
         usage(argv);
         ret = EXIT_FAILURE;
-        goto exit;
+        goto exit_free_options;
     }
 
     /* Open BD disc. */
-    BLURAY *bd = bd_open(options.input_device_path, "/home/nngai/.config/aacs/KEYDB.cfg");
+    BLURAY *bd = bd_open(options.input_device_path, options.aacs_keydb_path);
     if (!bd) {
         fprintf(stderr, "bd_open failed\n");
         ret = EXIT_FAILURE;
-        goto exit;
+        goto exit_free_options;
     }
 
     switch (options.op) {
@@ -236,6 +286,8 @@ int main(int argc, char **argv) {
 
 exit_close_bd:
     bd_close(bd);
+exit_free_options:
+    free_options(&options);
 exit:
     return ret;
 }
