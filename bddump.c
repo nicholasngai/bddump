@@ -101,6 +101,8 @@ int list_titles(BLURAY *bd) {
                 ((title_info->duration / 90000) % 3600) / 60,
                 ((title_info->duration / 90000) % 60),
                 title_info->chapter_count);
+
+        bd_free_title_info(title_info);
     }
 
     ret = 0;
