@@ -225,10 +225,45 @@ static BLURAY_STREAM_INFO *find_stream_info(BLURAY_CLIP_INFO *clip_info, int pid
 
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(BLURAY_CLIP_INFO *clip_info, AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
+static int remux(
+        const char *title,
+        BLURAY_TITLE_INFO *title_info,
+        BLURAY_CLIP_INFO *clip_info,
+        AVFormatContext *input_ctx,
+        AVFormatContext *output_ctx) {
     int ret;
 
     av_dump_format(input_ctx, 0, NULL, 0);
+
+    /* Add metadata. */
+    if (title) {
+        ret = av_dict_set(&output_ctx->metadata, "title", title, 0);
+        if (ret) {
+            fprintf(stderr, "av_dict_set title: %s\n", av_err2str(ret));
+            goto exit;
+        }
+    }
+    output_ctx->chapters = av_mallocz(title_info->chapter_count * sizeof(*output_ctx->chapters));
+    if (!output_ctx->chapters) {
+        fprintf(stderr, "av_mallocz chapters failed\n");
+        ret = -1;
+        goto exit;
+    }
+    output_ctx->nb_chapters = title_info->chapter_count;
+    for (size_t i = 0; i < title_info->chapter_count; i++) {
+        BLURAY_TITLE_CHAPTER *chapter_info = &title_info->chapters[i];
+        output_ctx->chapters[i] = (AVChapter *) av_malloc(sizeof(*output_ctx->chapters[i]));
+        if (!output_ctx->chapters[i]) {
+            fprintf(stderr, "av_mallocz chapter %zu failed\n", i);
+            ret = -1;
+            goto exit;
+        }
+        *output_ctx->chapters[i] = (AVChapter) {
+            .time_base = {1, 90000},
+            .start = chapter_info->start,
+            .end = chapter_info->start + chapter_info->duration,
+        };
+    }
 
     int stream_mapping_size = input_ctx->nb_streams;
     int *stream_mapping = (int *) calloc(stream_mapping_size, sizeof(*stream_mapping));
@@ -358,7 +393,13 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         goto exit;
     }
 
-    /* Get title info and clip info. */
+    /* Get disc, title, and clip info. */
+    const BLURAY_DISC_INFO *disc_info = bd_get_disc_info(bd);
+    if (!disc_info) {
+        fprintf(stderr, "bd_get_disc_info failed\n");
+        ret = -1;
+        goto exit;
+    }
     BLURAY_TITLE_INFO *title_info = bd_get_title_info(bd, title_index, 0);
     if (!title_info) {
         fprintf(stderr, "bd_get_title_info failed\n");
@@ -439,7 +480,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     output_ctx->pb = output_io_ctx;
 
     /* Remux. */
-    ret = remux(clip_info, input_ctx, output_ctx);
+    ret = remux(disc_info->disc_name, title_info, clip_info, input_ctx, output_ctx);
     if (ret) {
         goto exit_free_output_ctx;
     }
