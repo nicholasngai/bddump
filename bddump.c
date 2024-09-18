@@ -343,11 +343,13 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         goto exit_free_input_io_ctx;
     }
     input_ctx->pb = input_io_ctx;
-    if ((ret = avformat_open_input(&input_ctx, "", NULL, NULL)) < 0) {
+    ret = avformat_open_input(&input_ctx, "", NULL, NULL);
+    if (ret < 0) {
         fprintf(stderr, "avformat_open_input: %s\n", av_err2str(ret));
         goto exit_close_input_ctx;
     }
-    if ((ret = avformat_find_stream_info(input_ctx, NULL)) < 0) {
+    ret = avformat_find_stream_info(input_ctx, NULL);
+    if (ret < 0) {
         fprintf(stderr, "avformat_find_stream_info: %s\n", av_err2str(ret));
         goto exit_close_input_ctx;
     }
@@ -379,14 +381,16 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     }
     output_buf = NULL;
     AVFormatContext *output_ctx;
-    if ((ret = avformat_alloc_output_context2(&output_ctx, NULL, "matroska", NULL)) < 0) {
+    ret = avformat_alloc_output_context2(&output_ctx, NULL, "matroska", NULL);
+    if (ret < 0) {
         fprintf(stderr, "avformat_alloc_output_context2: %s\n", av_err2str(ret));
         goto exit_free_output_io_ctx;
     }
     output_ctx->pb = output_io_ctx;
 
     /* Remux. */
-    if ((ret = remux(input_ctx, output_ctx))) {
+    ret = remux(input_ctx, output_ctx);
+    if (ret) {
         goto exit_free_output_ctx;
     }
 
