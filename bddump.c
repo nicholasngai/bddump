@@ -205,9 +205,27 @@ static int fd_write(void *fd_, unsigned char *buf, int count) {
     return bytes_written;
 }
 
+static BLURAY_STREAM_INFO *find_stream_info(BLURAY_CLIP_INFO *clip_info, int pid) {
+#define SEARCH_STREAM(ARR, ARR_LEN) \
+    for (size_t i = 0; i < ARR_LEN; i++) { \
+        BLURAY_STREAM_INFO *stream_info = &ARR[i]; \
+        if (stream_info->pid == pid) { \
+            return stream_info; \
+        } \
+    }
+    SEARCH_STREAM(clip_info->video_streams, clip_info->video_stream_count);
+    SEARCH_STREAM(clip_info->sec_video_streams, clip_info->sec_video_stream_count);
+    SEARCH_STREAM(clip_info->audio_streams, clip_info->audio_stream_count);
+    SEARCH_STREAM(clip_info->sec_audio_streams, clip_info->sec_audio_stream_count);
+    SEARCH_STREAM(clip_info->pg_streams, clip_info->pg_stream_count);
+    SEARCH_STREAM(clip_info->ig_streams, clip_info->ig_stream_count);
+#undef SEARCH_STREAM
+    return NULL;
+}
+
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(BLURAY_CLIP_INFO *clip_info __attribute__((unused)), AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
+static int remux(BLURAY_CLIP_INFO *clip_info, AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
     int ret;
 
     av_dump_format(input_ctx, 0, NULL, 0);
@@ -247,6 +265,21 @@ static int remux(BLURAY_CLIP_INFO *clip_info __attribute__((unused)), AVFormatCo
             goto exit_free_stream_mapping;
         }
         out_stream->codecpar->codec_tag = 0;
+
+        /* Add language tag to metadata. */
+        BLURAY_STREAM_INFO *stream_info = find_stream_info(clip_info, in_stream->id);
+        if (!stream_info) {
+            fprintf(stderr, "Stream with PID %d not found in clip info\n", in_stream->id);
+            ret = -1;
+            goto exit_free_stream_mapping;
+        }
+        if (stream_info->lang[0]) {
+            ret = av_dict_set(&out_stream->metadata, "language", (const char *) stream_info->lang, 0);
+            if (ret) {
+                fprintf(stderr, "av_dict_set: %s\n", av_err2str(ret));
+                goto exit_free_stream_mapping;
+            }
+        }
     }
 
     av_dump_format(output_ctx, 0, NULL, 1);
