@@ -7,3 +7,8 @@ LDFLAGS =
 LDLIBS = -lbluray
 
 $(TARGET): $(OBJS)
+
+clean: FORCE
+	rm -rf $(TARGET) $(OBJS)
+
+FORCE:
