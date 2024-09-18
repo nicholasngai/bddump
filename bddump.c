@@ -1,14 +1,20 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <libavformat/avio.h>
+#include <libavformat/avformat.h>
+#include <libavutil/error.h>
 #include <libbluray/bluray.h>
 
 #define DEFAULT_AACS_KEYDB_PATH_HOME_SUFFIX "/.config/aacs/KEYDB.cfg"
+
+#define REMUXING_BUF_SIZE 4096
 
 enum bddump_operation {
     BDDUMP_OP_LIST_TITLES = 1,
@@ -158,7 +164,138 @@ exit:
     return ret;
 }
 
-int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
+static int bddump_read(void *bd_, unsigned char *buf, int count) {
+    BLURAY *bd = (BLURAY *) bd_;
+
+    int bytes_read = bd_read((BLURAY *) bd, buf, count);
+    if (bytes_read < 0) {
+        fprintf(stderr, "bd_read failed\n");
+        return AVERROR_EXTERNAL;
+    }
+    if (bytes_read == 0) {
+        return AVERROR_EOF;
+    }
+    return bytes_read;
+}
+
+static int64_t bddump_seek(void *bd_, int64_t pos, int whence) {
+    BLURAY *bd = (BLURAY *) bd_;
+
+    if (whence != SEEK_SET) {
+        fprintf(stderr, "bddump_seek called with unsupported whence %d\n", whence);
+        return AVERROR_EXTERNAL;
+    }
+    int64_t new_pos = bd_seek(bd, (uint64_t) pos);
+    if (new_pos < 0) {
+        fprintf(stderr, "bd_seek failed\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    return new_pos;
+}
+
+/* Largely borrowed from
+ * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
+static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, const char *out_filename) {
+    const AVOutputFormat *ofmt = NULL;
+    int ret;
+
+    av_dump_format(ifmt_ctx, 0, NULL, 0);
+
+    int stream_mapping_size = ifmt_ctx->nb_streams;
+    int *stream_mapping = (int *) av_mallocz(stream_mapping_size * sizeof(*stream_mapping));
+    if (!stream_mapping) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    ofmt = ofmt_ctx->oformat;
+
+    int stream_index = 0;
+    for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
+        AVStream *out_stream;
+        AVStream *in_stream = ifmt_ctx->streams[i];
+        AVCodecParameters *in_codecpar = in_stream->codecpar;
+        if (in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+            in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+            in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+            stream_mapping[i] = -1;
+            continue;
+        }
+        stream_mapping[i] = stream_index++;
+        out_stream = avformat_new_stream(ofmt_ctx, NULL);
+        if (!out_stream) {
+            fprintf(stderr, "Failed allocating output stream\n");
+            ret = AVERROR_UNKNOWN;
+            goto end;
+        }
+        ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to copy codec parameters\n");
+            goto end;
+        }
+        out_stream->codecpar->codec_tag = 0;
+    }
+    av_dump_format(ofmt_ctx, 0, NULL, 1);
+
+    if (!(ofmt->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&ofmt_ctx->pb, out_filename, AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            fprintf(stderr, "Could not open output file '%s'", out_filename);
+            goto end;
+        }
+    }
+
+    ret = avformat_write_header(ofmt_ctx, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error occurred when opening output file\n");
+        goto end;
+    }
+
+    AVPacket pkt;
+    while (1) {
+        AVStream *in_stream, *out_stream;
+        ret = av_read_frame(ifmt_ctx, &pkt);
+        if (ret < 0)
+            break;
+        in_stream  = ifmt_ctx->streams[pkt.stream_index];
+        if (pkt.stream_index >= stream_mapping_size ||
+            stream_mapping[pkt.stream_index] < 0) {
+            av_packet_unref(&pkt);
+            continue;
+        }
+        pkt.stream_index = stream_mapping[pkt.stream_index];
+        out_stream = ofmt_ctx->streams[pkt.stream_index];
+        /* copy packet */
+        pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+        pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+        pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
+        pkt.pos = -1;
+        ret = av_interleaved_write_frame(ofmt_ctx, &pkt);
+        if (ret < 0) {
+            fprintf(stderr, "Error muxing packet\n");
+            break;
+        }
+        av_packet_unref(&pkt);
+    }
+    av_write_trailer(ofmt_ctx);
+end:
+
+    /* close output */
+    if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
+        avio_closep(&ofmt_ctx->pb);
+
+    av_free(stream_mapping);
+
+    if (ret < 0 && ret != AVERROR_EOF) {
+        fprintf(stderr, "Error occurred: %s\n", av_err2str(ret));
+        return 1;
+    }
+
+    return 0;
+}
+
+static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     int ret;
 
     /* Count titles and validate num titles. */
@@ -176,6 +313,64 @@ int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         goto exit;
     }
 
+    /* Get title info and clip info. */
+    BLURAY_TITLE_INFO *title_info = bd_get_title_info(bd, title_index, 0);
+    if (!title_info) {
+        fprintf(stderr, "bd_get_title_info failed\n");
+        ret = -1;
+        goto exit;
+    }
+    if (title_info->clip_count != 1) {
+        fprintf(stderr, "Title %" PRIu32 " has %" PRIu32 " clips; only single-clip titles are supported at this time\n", title_index, title_info->clip_count);
+        ret = -1;
+        goto exit_free_title_info;
+    }
+
+    /* Allocate input I/O context attached to libbluray for remuxing. */
+    unsigned char *buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
+    if (!buf) {
+        fprintf(stderr, "av_malloc failed\n");
+        ret = -1;
+        goto exit_free_title_info;
+    }
+    AVIOContext *avio_ctx = avio_alloc_context(buf, REMUXING_BUF_SIZE, 0, bd, bddump_read, NULL, bddump_seek);
+    if (!avio_ctx) {
+        fprintf(stderr, "avio_alloc_context failed\n");
+        ret = -1;
+        goto exit_free_avio_buf;
+    }
+    /* AVIOContext manages the buffer and might reallocate it, so unset the buf
+     * pointer here to avoid confusion. */
+    buf = NULL;
+
+    /* Allocate input remuxing context. */
+    AVFormatContext *input_ctx = avformat_alloc_context();
+    if (!input_ctx) {
+        fprintf(stderr, "avformat_alloc_context failed\n");
+        ret = -1;
+        goto exit_free_avio_ctx;
+    }
+    input_ctx->pb = avio_ctx;
+    if ((ret = avformat_open_input(&input_ctx, "", NULL, NULL)) < 0) {
+        fprintf(stderr, "avformat_open_input: %s\n", av_err2str(ret));
+        goto exit_close_input_ctx;
+    }
+    if ((ret = avformat_find_stream_info(input_ctx, NULL)) < 0) {
+        fprintf(stderr, "avformat_find_stream_info: %s\n", av_err2str(ret));
+        goto exit_close_input_ctx;
+    }
+
+    /* Allocate output remuxing context. */
+    AVFormatContext *output_ctx;
+    if ((ret = avformat_alloc_output_context2(&output_ctx, NULL, "matroska", out_path)) < 0) {
+        fprintf(stderr, "avformat_alloc_output_context2: %s\n", av_err2str(ret));
+        goto exit_close_input_ctx;
+    }
+
+    if ((ret = remux(input_ctx, output_ctx, out_path))) {
+        goto exit_free_output_ctx;
+    }
+
     /* Open file for dumping. */
     FILE *outfile;
     if (strcmp(out_path, "-") == 0) {
@@ -185,7 +380,7 @@ int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         if (!outfile) {
             perror("fopen");
             ret = -1;
-            goto exit;
+            goto exit_free_output_ctx;
         }
     }
 
@@ -218,6 +413,19 @@ exit_close_outfile:
     if (outfile != stdout) {
         fclose(outfile);
     }
+exit_free_output_ctx:
+    avformat_free_context(output_ctx);
+exit_close_input_ctx:
+    avformat_close_input(&input_ctx);
+exit_free_avio_ctx:
+    av_free(avio_ctx->buffer);
+    avio_context_free(&avio_ctx);
+exit_free_avio_buf:
+    if (buf) {
+        av_free(buf);
+    }
+exit_free_title_info:
+    bd_free_title_info(title_info);
 exit:
     return ret;
 }
