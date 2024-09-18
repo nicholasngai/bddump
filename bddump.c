@@ -207,88 +207,104 @@ static int fd_write(void *fd_, unsigned char *buf, int count) {
 
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx) {
+static int remux(BLURAY_CLIP_INFO *clip_info __attribute__((unused)), AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
     int ret;
 
-    av_dump_format(ifmt_ctx, 0, NULL, 0);
+    av_dump_format(input_ctx, 0, NULL, 0);
 
-    int stream_mapping_size = ifmt_ctx->nb_streams;
-    int *stream_mapping = (int *) av_mallocz(stream_mapping_size * sizeof(*stream_mapping));
+    int stream_mapping_size = input_ctx->nb_streams;
+    int *stream_mapping = (int *) calloc(stream_mapping_size, sizeof(*stream_mapping));
     if (!stream_mapping) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        perror("calloc");
+        ret = -1;
+        goto exit;
     }
 
-    int stream_index = 0;
-    for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
-        AVStream *out_stream;
-        AVStream *in_stream = ifmt_ctx->streams[i];
+    size_t stream_index = 0;
+    for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
+        /* Map stream to output if it's video, audio, or subtitle. */
+        AVStream *in_stream = input_ctx->streams[i];
         AVCodecParameters *in_codecpar = in_stream->codecpar;
-        if (in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-            in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
-            in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+        if (in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO
+            && in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO
+            && in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
             stream_mapping[i] = -1;
             continue;
         }
-        stream_mapping[i] = stream_index++;
-        out_stream = avformat_new_stream(ofmt_ctx, NULL);
+        stream_mapping[i] = stream_index;
+        stream_index++;
+
+        /* Make output stream. */
+        AVStream *out_stream = avformat_new_stream(output_ctx, NULL);
         if (!out_stream) {
-            fprintf(stderr, "Failed allocating output stream\n");
-            ret = AVERROR_UNKNOWN;
-            goto end;
+            fprintf(stderr, "avformat_new_stream failed\n");
+            ret = -1;
+            goto exit_free_stream_mapping;
         }
         ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar);
         if (ret < 0) {
-            fprintf(stderr, "Failed to copy codec parameters\n");
-            goto end;
+            fprintf(stderr, "avcodec_parameters_copy: %s\n", av_err2str(ret));
+            goto exit_free_stream_mapping;
         }
         out_stream->codecpar->codec_tag = 0;
     }
-    av_dump_format(ofmt_ctx, 0, NULL, 1);
 
-    ret = avformat_write_header(ofmt_ctx, NULL);
+    av_dump_format(output_ctx, 0, NULL, 1);
+
+    /* Write header. */
+    ret = avformat_write_header(output_ctx, NULL);
     if (ret < 0) {
         fprintf(stderr, "Error occurred when opening output file\n");
-        goto end;
+        goto exit_free_stream_mapping;
     }
 
-    AVPacket pkt;
+    /* Write packets. */
     while (1) {
-        AVStream *in_stream, *out_stream;
-        ret = av_read_frame(ifmt_ctx, &pkt);
-        if (ret < 0)
+        /* Read packet .*/
+        AVPacket pkt;
+        ret = av_read_frame(input_ctx, &pkt);
+        if (ret == AVERROR_EOF) {
             break;
-        in_stream  = ifmt_ctx->streams[pkt.stream_index];
-        if (pkt.stream_index >= stream_mapping_size ||
-            stream_mapping[pkt.stream_index] < 0) {
+        }
+        if (ret) {
+            goto exit_free_stream_mapping;
+        }
+
+        /* Validate packet's stream .*/
+        AVStream *in_stream = input_ctx->streams[pkt.stream_index];
+        if (pkt.stream_index >= stream_mapping_size || stream_mapping[pkt.stream_index] < 0) {
             av_packet_unref(&pkt);
             continue;
         }
         pkt.stream_index = stream_mapping[pkt.stream_index];
-        out_stream = ofmt_ctx->streams[pkt.stream_index];
-        /* copy packet */
+        AVStream *out_stream = output_ctx->streams[pkt.stream_index];
+
+        /* Copy packet. */
         pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
         pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
         pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
         pkt.pos = -1;
-        ret = av_interleaved_write_frame(ofmt_ctx, &pkt);
+        ret = av_interleaved_write_frame(output_ctx, &pkt);
         if (ret < 0) {
-            fprintf(stderr, "Error muxing packet\n");
-            break;
+            fprintf(stderr, "av_interleaved_write_frame: %s\n", av_err2str(ret));
+            av_packet_unref(&pkt);
+            goto exit_free_stream_mapping;
         }
+
         av_packet_unref(&pkt);
     }
-    av_write_trailer(ofmt_ctx);
-end:
 
-    av_free(stream_mapping);
-
-    if (ret < 0 && ret != AVERROR_EOF) {
-        fprintf(stderr, "Error occurred: %s\n", av_err2str(ret));
-        return 1;
+    /* Write trailer. */
+    ret = av_write_trailer(output_ctx);
+    if (ret) {
+        fprintf(stderr, "av_write_trailer: %s\n", av_err2str(ret));
+        goto exit_free_stream_mapping;
     }
 
-    return 0;
+exit_free_stream_mapping:
+    free(stream_mapping);
+exit:
+    return ret;
 }
 
 static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
@@ -321,6 +337,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         ret = -1;
         goto exit_free_title_info;
     }
+    BLURAY_CLIP_INFO *clip_info = &title_info->clips[0];
 
     /* Allocate input I/O context attached to libbluray for remuxing. */
     unsigned char *input_buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
@@ -389,7 +406,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     output_ctx->pb = output_io_ctx;
 
     /* Remux. */
-    ret = remux(input_ctx, output_ctx);
+    ret = remux(clip_info, input_ctx, output_ctx);
     if (ret) {
         goto exit_free_output_ctx;
     }
