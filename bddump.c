@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -194,10 +195,19 @@ static int64_t bddump_seek(void *bd_, int64_t pos, int whence) {
     return new_pos;
 }
 
+static int fd_write(void *fd_, unsigned char *buf, int count) {
+    int *fd = (int *) fd_;
+    int bytes_written = write(*fd, buf, count);
+    if (bytes_written < 0) {
+        perror("write");
+        return AVERROR_EXTERNAL;
+    }
+    return bytes_written;
+}
+
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, const char *out_filename) {
-    const AVOutputFormat *ofmt = NULL;
+static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx) {
     int ret;
 
     av_dump_format(ifmt_ctx, 0, NULL, 0);
@@ -208,8 +218,6 @@ static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, const cha
         ret = AVERROR(ENOMEM);
         goto end;
     }
-
-    ofmt = ofmt_ctx->oformat;
 
     int stream_index = 0;
     for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
@@ -237,14 +245,6 @@ static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, const cha
         out_stream->codecpar->codec_tag = 0;
     }
     av_dump_format(ofmt_ctx, 0, NULL, 1);
-
-    if (!(ofmt->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&ofmt_ctx->pb, out_filename, AVIO_FLAG_WRITE);
-        if (ret < 0) {
-            fprintf(stderr, "Could not open output file '%s'", out_filename);
-            goto end;
-        }
-    }
 
     ret = avformat_write_header(ofmt_ctx, NULL);
     if (ret < 0) {
@@ -280,10 +280,6 @@ static int remux(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, const cha
     }
     av_write_trailer(ofmt_ctx);
 end:
-
-    /* close output */
-    if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
-        avio_closep(&ofmt_ctx->pb);
 
     av_free(stream_mapping);
 
@@ -327,30 +323,26 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     }
 
     /* Allocate input I/O context attached to libbluray for remuxing. */
-    unsigned char *buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
-    if (!buf) {
+    unsigned char *input_buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
+    if (!input_buf) {
         fprintf(stderr, "av_malloc failed\n");
         ret = -1;
         goto exit_free_title_info;
     }
-    AVIOContext *avio_ctx = avio_alloc_context(buf, REMUXING_BUF_SIZE, 0, bd, bddump_read, NULL, bddump_seek);
-    if (!avio_ctx) {
+    AVIOContext *input_io_ctx = avio_alloc_context(input_buf, REMUXING_BUF_SIZE, 0, bd, bddump_read, NULL, bddump_seek);
+    if (!input_io_ctx) {
         fprintf(stderr, "avio_alloc_context failed\n");
         ret = -1;
-        goto exit_free_avio_buf;
+        goto exit_free_avio_input_buf;
     }
-    /* AVIOContext manages the buffer and might reallocate it, so unset the buf
-     * pointer here to avoid confusion. */
-    buf = NULL;
-
-    /* Allocate input remuxing context. */
+    input_buf = NULL;
     AVFormatContext *input_ctx = avformat_alloc_context();
     if (!input_ctx) {
         fprintf(stderr, "avformat_alloc_context failed\n");
         ret = -1;
-        goto exit_free_avio_ctx;
+        goto exit_free_input_io_ctx;
     }
-    input_ctx->pb = avio_ctx;
+    input_ctx->pb = input_io_ctx;
     if ((ret = avformat_open_input(&input_ctx, "", NULL, NULL)) < 0) {
         fprintf(stderr, "avformat_open_input: %s\n", av_err2str(ret));
         goto exit_close_input_ctx;
@@ -360,69 +352,65 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         goto exit_close_input_ctx;
     }
 
-    /* Allocate output remuxing context. */
-    AVFormatContext *output_ctx;
-    if ((ret = avformat_alloc_output_context2(&output_ctx, NULL, "matroska", out_path)) < 0) {
-        fprintf(stderr, "avformat_alloc_output_context2: %s\n", av_err2str(ret));
-        goto exit_close_input_ctx;
+    /* Open file for dumping. */
+    int out_fd;
+    if (strcmp(out_path, "-") == 0) {
+        out_fd = STDOUT_FILENO;
+    } else {
+        out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (out_fd < 0) {
+            perror("open");
+            ret = -1;
+            goto exit_close_input_ctx;
+        }
     }
 
-    if ((ret = remux(input_ctx, output_ctx, out_path))) {
+    /* Allocate output remuxing context. */
+    unsigned char *output_buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
+    if (!output_buf) {
+        fprintf(stderr, "av_malloc failed\n");
+        ret = -1;
+        goto exit_close_out_fd;
+    }
+    AVIOContext *output_io_ctx = avio_alloc_context(output_buf, REMUXING_BUF_SIZE, 1, &out_fd, NULL, fd_write, NULL);
+    if (!output_io_ctx) {
+        fprintf(stderr, "avio_alloc_context failed\n");
+        goto exit_free_output_buf;
+    }
+    output_buf = NULL;
+    AVFormatContext *output_ctx;
+    if ((ret = avformat_alloc_output_context2(&output_ctx, NULL, "matroska", NULL)) < 0) {
+        fprintf(stderr, "avformat_alloc_output_context2: %s\n", av_err2str(ret));
+        goto exit_free_output_io_ctx;
+    }
+    output_ctx->pb = output_io_ctx;
+
+    /* Remux. */
+    if ((ret = remux(input_ctx, output_ctx))) {
         goto exit_free_output_ctx;
     }
 
-    /* Open file for dumping. */
-    FILE *outfile;
-    if (strcmp(out_path, "-") == 0) {
-        outfile = stdout;
-    } else {
-        outfile = fopen(out_path, "w");
-        if (!outfile) {
-            perror("fopen");
-            ret = -1;
-            goto exit_free_output_ctx;
-        }
-    }
-
-    /* Dump. */
-    for (;;) {
-        /* Read. */
-        unsigned char buf[4096];
-        int bytes_read = bd_read(bd, buf, sizeof(buf));
-        if (bytes_read < 0) {
-            fprintf(stderr, "bd_read failed\n");
-            ret = -1;
-            goto exit_close_outfile;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
-
-        /* Write. */
-        size_t bytes_written = fwrite(buf, 1, bytes_read, outfile);
-        if (bytes_written != (size_t) bytes_read) {
-            perror("fwrite");
-            ret = -1;
-            goto exit_close_outfile;
-        }
-    }
-
-    ret = 0;
-
-exit_close_outfile:
-    if (outfile != stdout) {
-        fclose(outfile);
-    }
 exit_free_output_ctx:
     avformat_free_context(output_ctx);
+exit_free_output_io_ctx:
+    av_free(output_io_ctx->buffer);
+    avio_context_free(&output_io_ctx);
+exit_free_output_buf:
+    if (output_buf) {
+        av_free(output_buf);
+    }
+exit_close_out_fd:
+    if (out_fd != STDOUT_FILENO) {
+        close(out_fd);
+    }
 exit_close_input_ctx:
     avformat_close_input(&input_ctx);
-exit_free_avio_ctx:
-    av_free(avio_ctx->buffer);
-    avio_context_free(&avio_ctx);
-exit_free_avio_buf:
-    if (buf) {
-        av_free(buf);
+exit_free_input_io_ctx:
+    av_free(input_io_ctx->buffer);
+    avio_context_free(&input_io_ctx);
+exit_free_avio_input_buf:
+    if (input_buf) {
+        av_free(input_buf);
     }
 exit_free_title_info:
     bd_free_title_info(title_info);
