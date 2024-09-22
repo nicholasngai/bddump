@@ -303,12 +303,7 @@ static int remux(
 
         /* Add language tag to metadata. */
         BLURAY_STREAM_INFO *stream_info = find_stream_info(clip_info, in_stream->id);
-        if (!stream_info) {
-            fprintf(stderr, "Stream with PID %d not found in clip info\n", in_stream->id);
-            ret = -1;
-            goto exit_free_stream_mapping;
-        }
-        if (stream_info->lang[0]) {
+        if (stream_info && stream_info->lang[0]) {
             ret = av_dict_set(&out_stream->metadata, "language", (const char *) stream_info->lang, 0);
             if (ret) {
                 fprintf(stderr, "av_dict_set: %s\n", av_err2str(ret));
