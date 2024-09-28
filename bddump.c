@@ -532,6 +532,25 @@ int main(int argc, char **argv) {
         goto exit_free_options;
     }
 
+    /* Dump metadata. */
+    const BLURAY_DISC_INFO *disc_info = bd_get_disc_info(bd);
+    if (!disc_info) {
+        fprintf(stderr, "bd_get_disc_info failed\n");
+        ret = EXIT_FAILURE;
+        goto exit_close_bd;
+    }
+    fprintf(stderr, "AACS status: ");
+    if (disc_info->aacs_detected) {
+        fprintf(stderr, "AACS detected\n");
+        fprintf(stderr, "MKB version: v%d\n", disc_info->aacs_mkbv);
+        fprintf(stderr, "AACS handled: %d\n", disc_info->aacs_handled);
+        if (!disc_info->aacs_handled) {
+            fprintf(stderr, "AACS handling error: %d\n", disc_info->aacs_error_code);
+        }
+    } else {
+        fprintf(stderr, "No AACS detected\n");
+    }
+
     switch (options.op) {
     case BDDUMP_OP_LIST_TITLES:
         if (list_titles(bd)) {
