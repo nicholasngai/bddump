@@ -205,32 +205,29 @@ static int fd_write(void *fd_, unsigned char *buf, int count) {
     return bytes_written;
 }
 
-static BLURAY_STREAM_INFO *find_stream_info(BLURAY_CLIP_INFO *clip_info, int pid) {
+static BLURAY_STREAM_INFO *find_stream_info(BLURAY_CLIP_INFO *clip_infos, size_t clip_infos_len, int pid) {
+    for (size_t i = 0; i < clip_infos_len; i++) {
 #define SEARCH_STREAM(ARR, ARR_LEN) \
-    for (size_t i = 0; i < ARR_LEN; i++) { \
-        BLURAY_STREAM_INFO *stream_info = &ARR[i]; \
-        if (stream_info->pid == pid) { \
-            return stream_info; \
-        } \
-    }
-    SEARCH_STREAM(clip_info->video_streams, clip_info->video_stream_count);
-    SEARCH_STREAM(clip_info->sec_video_streams, clip_info->sec_video_stream_count);
-    SEARCH_STREAM(clip_info->audio_streams, clip_info->audio_stream_count);
-    SEARCH_STREAM(clip_info->sec_audio_streams, clip_info->sec_audio_stream_count);
-    SEARCH_STREAM(clip_info->pg_streams, clip_info->pg_stream_count);
-    SEARCH_STREAM(clip_info->ig_streams, clip_info->ig_stream_count);
+        for (size_t j = 0; j < (ARR_LEN); j++) { \
+            BLURAY_STREAM_INFO *stream_info = &(ARR)[j]; \
+            if (stream_info->pid == pid) { \
+                return stream_info; \
+            } \
+        }
+        SEARCH_STREAM(clip_infos[i].video_streams, clip_infos[i].video_stream_count);
+        SEARCH_STREAM(clip_infos[i].sec_video_streams, clip_infos[i].sec_video_stream_count);
+        SEARCH_STREAM(clip_infos[i].audio_streams, clip_infos[i].audio_stream_count);
+        SEARCH_STREAM(clip_infos[i].sec_audio_streams, clip_infos[i].sec_audio_stream_count);
+        SEARCH_STREAM(clip_infos[i].pg_streams, clip_infos[i].pg_stream_count);
+        SEARCH_STREAM(clip_infos[i].ig_streams, clip_infos[i].ig_stream_count);
 #undef SEARCH_STREAM
+    }
     return NULL;
 }
 
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(
-        const char *title,
-        BLURAY_TITLE_INFO *title_info,
-        BLURAY_CLIP_INFO *clip_info,
-        AVFormatContext *input_ctx,
-        AVFormatContext *output_ctx) {
+static int remux(const char *title, BLURAY_TITLE_INFO *title_info, AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
     int ret;
 
     av_dump_format(input_ctx, 0, NULL, 0);
@@ -302,7 +299,7 @@ static int remux(
         out_stream->codecpar->codec_tag = 0;
 
         /* Add language tag to metadata. */
-        BLURAY_STREAM_INFO *stream_info = find_stream_info(clip_info, in_stream->id);
+        BLURAY_STREAM_INFO *stream_info = find_stream_info(title_info->clips, title_info->clip_count, in_stream->id);
         if (stream_info && stream_info->lang[0]) {
             ret = av_dict_set(&out_stream->metadata, "language", (const char *) stream_info->lang, 0);
             if (ret) {
@@ -388,7 +385,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         goto exit;
     }
 
-    /* Get disc, title, and clip info. */
+    /* Get disc and title info. */
     const BLURAY_DISC_INFO *disc_info = bd_get_disc_info(bd);
     if (!disc_info) {
         fprintf(stderr, "bd_get_disc_info failed\n");
@@ -401,12 +398,6 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
         ret = -1;
         goto exit;
     }
-    if (title_info->clip_count != 1) {
-        fprintf(stderr, "Title %" PRIu32 " has %" PRIu32 " clips; only single-clip titles are supported at this time\n", title_index, title_info->clip_count);
-        ret = -1;
-        goto exit_free_title_info;
-    }
-    BLURAY_CLIP_INFO *clip_info = &title_info->clips[0];
 
     /* Allocate input I/O context attached to libbluray for remuxing. */
     unsigned char *input_buf = (unsigned char *) av_malloc(REMUXING_BUF_SIZE);
@@ -475,7 +466,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     output_ctx->pb = output_io_ctx;
 
     /* Remux. */
-    ret = remux(disc_info->disc_name, title_info, clip_info, input_ctx, output_ctx);
+    ret = remux(disc_info->disc_name, title_info, input_ctx, output_ctx);
     if (ret) {
         goto exit_free_output_ctx;
     }
