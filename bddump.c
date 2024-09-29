@@ -28,6 +28,8 @@ struct bddump_options {
     char *aacs_keydb_path;
     bool aacs_keydb_path_is_alloced;
     uint32_t title_index;
+    unsigned long *excluded_stream_indices;
+    size_t excluded_stream_indices_len;
     const char *out_path;
 };
 
@@ -35,8 +37,15 @@ static void usage(char **argv) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -l\n", argv[0]);
-    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> -o <out file>\n", argv[0]);
-    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> -o -\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o <out file>\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o -\n", argv[0]);
+}
+
+static void free_options(struct bddump_options *options) {
+    if (options->aacs_keydb_path_is_alloced) {
+        free(options->aacs_keydb_path);
+    }
+    free(options->excluded_stream_indices);
 }
 
 /* Parses arguments from the command line. */
@@ -50,7 +59,7 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
     };
 
     for (;;) {
-        int opt = getopt(argc, argv, "d:a:lt:o:h");
+        int opt = getopt(argc, argv, "d:a:lt:x:o:h");
         if (opt == -1) {
             break;
         }
@@ -68,12 +77,12 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
             if (*endptr) {
                 fprintf(stderr, "Invalid title index: %s\n", optarg);
                 ret = -1;
-                goto exit;
+                goto exit_free;
             }
             if (title_index == ULONG_MAX) {
                 perror("strtoul");
                 ret = -1;
-                goto exit;
+                goto exit_free;
             }
             options->title_index = title_index;
             break;
@@ -84,6 +93,27 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
         case 'a':
             options->aacs_keydb_path = optarg;
             break;
+        case 'x': {
+            char *endptr;
+            unsigned long excluded_stream_index = strtoul(optarg, &endptr, 10);
+            if (*endptr) {
+                fprintf(stderr, "Invalid excluded stream index: %s\n", optarg);
+                ret = -1;
+                goto exit_free;
+            }
+
+            size_t *new_excluded_stream_indices = realloc(options->excluded_stream_indices, (options->excluded_stream_indices_len + 1) * sizeof(*new_excluded_stream_indices));
+            if (!new_excluded_stream_indices) {
+                perror("realloc excluded_stream_indices");
+                ret = -1;
+                goto exit_free;
+            }
+            options->excluded_stream_indices = new_excluded_stream_indices;
+            options->excluded_stream_indices_len++;
+            options->excluded_stream_indices[options->excluded_stream_indices_len - 1] = excluded_stream_index;
+
+            break;
+        }
         case 'h':
         default:
             usage(argv);
@@ -99,7 +129,7 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
         if (!home) {
             fprintf(stderr, "HOME variable is unset; cannot infer default AACS KEYDB.cfg path!\n");
             ret = -1;
-            goto exit;
+            goto exit_free;
         }
 
         /* Alloc buffer for $HOME/.config/aacs/KEYDB.cfg. */
@@ -107,7 +137,7 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
         if (!home_keydb) {
             perror("malloc home_keydb");
             ret = -1;
-            goto exit;
+            goto exit_free;
         }
         sprintf(home_keydb, "%s" DEFAULT_AACS_KEYDB_PATH_HOME_SUFFIX, home);
 
@@ -115,16 +145,11 @@ static int parse_options(int argc, char **argv, struct bddump_options *options) 
         options->aacs_keydb_path_is_alloced = true;
     }
 
-    ret = 0;
+    return 0;
 
-exit:
+exit_free:
+    free_options(options);
     return ret;
-}
-
-static void free_options(struct bddump_options *options) {
-    if (options->aacs_keydb_path_is_alloced) {
-        free(options->aacs_keydb_path);
-    }
 }
 
 int list_titles(BLURAY *bd) {
@@ -227,7 +252,13 @@ static BLURAY_STREAM_INFO *find_stream_info(BLURAY_CLIP_INFO *clip_infos, size_t
 
 /* Largely borrowed from
  * https://ffmpeg.org/doxygen/4.0/remuxing_8c-example.html. */
-static int remux(const char *title, BLURAY_TITLE_INFO *title_info, AVFormatContext *input_ctx, AVFormatContext *output_ctx) {
+static int remux(
+        const char *title,
+        BLURAY_TITLE_INFO *title_info,
+        AVFormatContext *input_ctx,
+        AVFormatContext *output_ctx,
+        unsigned long *excluded_stream_indices,
+        size_t excluded_stream_indices_len) {
     int ret;
 
     av_dump_format(input_ctx, 0, NULL, 0);
@@ -272,12 +303,22 @@ static int remux(const char *title, BLURAY_TITLE_INFO *title_info, AVFormatConte
 
     size_t stream_index = 0;
     for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
+        /* Skip excluded stream indices. */
+        bool should_skip = false;
+        for (size_t j = 0; j < excluded_stream_indices_len; j++) {
+            if (i == excluded_stream_indices[j]) {
+                should_skip = true;
+                break;
+            }
+        }
+
         /* Map stream to output if it's video, audio, or subtitle. */
         AVStream *in_stream = input_ctx->streams[i];
         AVCodecParameters *in_codecpar = in_stream->codecpar;
-        if (in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO
-            && in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO
-            && in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+        if (should_skip
+                || (in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO
+                    && in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO
+                    && in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)) {
             stream_mapping[i] = -1;
             continue;
         }
@@ -367,7 +408,7 @@ exit:
     return ret;
 }
 
-static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
+static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path, unsigned long *excluded_stream_indices, size_t excluded_stream_indices_len) {
     int ret;
 
     /* Count titles and validate num titles. */
@@ -466,7 +507,7 @@ static int dump_bluray(BLURAY *bd, uint32_t title_index, const char *out_path) {
     output_ctx->pb = output_io_ctx;
 
     /* Remux. */
-    ret = remux(disc_info->disc_name, title_info, input_ctx, output_ctx);
+    ret = remux(disc_info->disc_name, title_info, input_ctx, output_ctx, excluded_stream_indices, excluded_stream_indices_len);
     if (ret) {
         goto exit_free_output_ctx;
     }
@@ -565,7 +606,7 @@ int main(int argc, char **argv) {
             goto exit_close_bd;
         }
 
-        if (dump_bluray(bd, options.title_index, options.out_path)) {
+        if (dump_bluray(bd, options.title_index, options.out_path, options.excluded_stream_indices, options.excluded_stream_indices_len)) {
             ret = EXIT_FAILURE;
             goto exit_close_bd;
         }
