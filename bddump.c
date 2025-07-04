@@ -36,9 +36,9 @@ struct bddump_options {
 static void usage(char **argv) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -l\n", argv[0]);
-    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o <out file>\n", argv[0]);
-    fprintf(stderr, "%s -d <device> [-a AACS <KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o -\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a <AACS KEYDB.cfg path>] -l\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a <AACS KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o <out file>\n", argv[0]);
+    fprintf(stderr, "%s -d <device> [-a <AACS KEYDB.cfg path>] -t <title> [-x <excluded stream index>] -o -\n", argv[0]);
 }
 
 static void free_options(struct bddump_options *options) {
