@@ -296,9 +296,15 @@ static int remux(
     int stream_mapping_size = input_ctx->nb_streams;
     int *stream_mapping = (int *) calloc(stream_mapping_size, sizeof(*stream_mapping));
     if (!stream_mapping) {
-        perror("calloc");
+        perror("calloc stream_mapping");
         ret = -1;
         goto exit;
+    }
+    int64_t *last_dts = (int64_t *) calloc(stream_mapping_size, sizeof(*last_dts));
+    if (!last_dts) {
+        perror("calloc last_dts");
+        ret = -1;
+        goto exit_free_stream_mapping;
     }
 
     size_t stream_index = 0;
@@ -330,12 +336,12 @@ static int remux(
         if (!out_stream) {
             fprintf(stderr, "avformat_new_stream failed\n");
             ret = -1;
-            goto exit_free_stream_mapping;
+            goto exit_free_last_dts;
         }
         ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar);
         if (ret < 0) {
             fprintf(stderr, "avcodec_parameters_copy: %s\n", av_err2str(ret));
-            goto exit_free_stream_mapping;
+            goto exit_free_last_dts;
         }
         out_stream->codecpar->codec_tag = 0;
 
@@ -345,7 +351,7 @@ static int remux(
             ret = av_dict_set(&out_stream->metadata, "language", (const char *) stream_info->lang, 0);
             if (ret) {
                 fprintf(stderr, "av_dict_set: %s\n", av_err2str(ret));
-                goto exit_free_stream_mapping;
+                goto exit_free_last_dts;
             }
         }
     }
@@ -356,7 +362,7 @@ static int remux(
     ret = avformat_write_header(output_ctx, NULL);
     if (ret < 0) {
         fprintf(stderr, "Error occurred when opening output file\n");
-        goto exit_free_stream_mapping;
+        goto exit_free_last_dts;
     }
 
     /* Write packets. */
@@ -368,19 +374,27 @@ static int remux(
             break;
         }
         if (ret) {
-            goto exit_free_stream_mapping;
+            goto exit_free_last_dts;
         }
 
-        /* Validate packet's stream .*/
-        AVStream *in_stream = input_ctx->streams[pkt.stream_index];
+        /* Validate packet's stream. */
         if (pkt.stream_index >= stream_mapping_size || stream_mapping[pkt.stream_index] < 0) {
             av_packet_unref(&pkt);
             continue;
         }
+
+        /* Discard non-monotonically increasing DTS. */
         pkt.stream_index = stream_mapping[pkt.stream_index];
-        AVStream *out_stream = output_ctx->streams[pkt.stream_index];
+        if (pkt.dts < last_dts[pkt.stream_index]) {
+            fprintf(stderr, "Warning: Non-monotonically increasing DTS in stream %d. Was %" PRIi64 ", now %" PRIi64 "\n", pkt.stream_index, last_dts[pkt.stream_index], pkt.dts);
+            av_packet_unref(&pkt);
+            continue;
+        }
+        last_dts[pkt.stream_index] = pkt.dts;
 
         /* Copy packet. */
+        AVStream *in_stream = input_ctx->streams[pkt.stream_index];
+        AVStream *out_stream = output_ctx->streams[pkt.stream_index];
         pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
         pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
         pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
@@ -389,7 +403,7 @@ static int remux(
         if (ret < 0) {
             fprintf(stderr, "av_interleaved_write_frame: %s\n", av_err2str(ret));
             av_packet_unref(&pkt);
-            goto exit_free_stream_mapping;
+            goto exit_free_last_dts;
         }
 
         av_packet_unref(&pkt);
@@ -402,6 +416,8 @@ static int remux(
         goto exit_free_stream_mapping;
     }
 
+exit_free_last_dts:
+    free(last_dts);
 exit_free_stream_mapping:
     free(stream_mapping);
 exit:
