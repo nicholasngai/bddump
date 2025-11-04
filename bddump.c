@@ -220,7 +220,7 @@ static int64_t bddump_seek(void *bd_, int64_t pos, int whence) {
     return new_pos;
 }
 
-static int fd_write(void *fd_, unsigned char *buf, int count) {
+static int fd_write(void *fd_, const unsigned char *buf, int count) {
     int *fd = (int *) fd_;
     int bytes_written = write(*fd, buf, count);
     if (bytes_written < 0) {
